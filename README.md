@@ -155,7 +155,7 @@ idf.py build
 idf.py -p COM3 flash monitor
 ```
 
-**Wi‑Fi:** Join AP **`ESP32-S3-Matrix`** / password **`adminadmin`**, then open **http://10.50.50.1/** (static AP address). The web UI sets **message text**, **speed** (1–10), **display mode**, **marquee direction** (`left`, `right`, `up`, `down`), **one-character zoom** (`none`, `in`, `out`), **color** presets, optional **rainbow** on lit pixels, and **Turn off LEDs**. **Endpoints:** **`/`** (UI), **`/getData`**, **`/SendData?data=…`**, **`/api/config`** with query keys including **`speed`**, **`mode`**, **`color`**, **`rainbow`**, **`direction`**, **`zoom`** — `mode` is `marquee`, `onechar`, `static`, or `fill`; `direction` applies to marquee scrolling (horizontal: left/right; vertical: down = top-to-bottom, up = bottom-to-top); `zoom` is `none`, `in`, or `out` (one-character mode: eight-frame grow/shrink per glyph). Legacy **`/RGBOn`** / **`/RGBOff`** compatibility routes still work (green lamp vs. clear + marquee).
+**Wi‑Fi:** Join AP **`ESP32-S3-Matrix`** / password **`adminadmin`**, then open **http://10.50.50.1/** (static AP address). The web UI sets **message text**, **speed** (1–10), **brightness** (1–255), **display mode**, **marquee direction** (`left`, `right`), **font size** (`large`, `medium`, `small`), **one-character zoom** (`none`, `in`, `out`), **color** presets, optional **rainbow** on lit pixels, and **Turn off LEDs**. **Message and settings are stored in NVS** and restored after reboot. **Endpoints:** **`/`** (UI), **`/getData`**, **`/SendData?data=…`**, **`/api/config`** with query keys including **`speed`**, **`brightness`**, **`mode`**, **`color`**, **`rainbow`**, **`direction`**, **`fontsize`**, **`zoom`** — `mode` is `marquee`, `onechar`, `static`, or `fill`; `direction` is horizontal marquee only (`left` / `right`); `fontsize` scales glyphs for marquee, static, and one-character modes; `zoom` is `none`, `in`, or `out` (one-character mode: eight-frame grow/shrink per glyph). Legacy **`/RGBOn`** / **`/RGBOff`** compatibility routes still work (green lamp vs. clear + marquee).
 
 **Chinese (UTF-8):** Send **UTF-8** text from the browser (_encodeURIComponent_ handles Chinese). **`/SendData`** percent-decodes `data`, resets one-character mode, and enables animation so new text appears immediately. The matrix uses **`glcdfont`** for ASCII and an **8×8 Chinese subset** in **`main/cjk8x8.c`**. Codepoints **not** in that table show **`?`**. Add `{ Unicode, { 8 row bytes } }` to **`k_glyphs[]`** (sorted by codepoint) to extend coverage.
 
@@ -178,17 +178,17 @@ Change **`SCORE_DISPLAY_MS`** in `snake_matrix_main.c` to adjust how long the sc
 
 **LED brightness (doc + tuning):** the [Waveshare wiki](https://www.waveshare.net/wiki/ESP32-S3-Matrix) says not to set the matrix **too bright**—high brightness can make the board **overheat and be damaged** (see the “Please note the lamp brightness…” / 灯珠亮度 warnings in their example pages). They do not give a single safe number; treat it as “keep it moderate,” especially for long runs.
 
-In these IDF projects, overall dimming is a single scale **`BRIGHTNESS`** in C (roughly 1–255, **lower = dimmer**):
+In these IDF projects, overall dimming is usually a **`BRIGHTNESS`** define in C (roughly 1–255, **lower = dimmer**). **`http_matrix`** also exposes **`brightness`** at runtime via the web UI and **`/api/config?brightness=`** (1–255); the compile-time **`BRIGHTNESS_DEFAULT`** only sets the value at boot until you change it from the UI.
 
-| App            | File                                           | Symbol               |
-| -------------- | ---------------------------------------------- | -------------------- |
-| `color_matrix` | `src/color_matrix/main/color_matrix_main.c`    | `#define BRIGHTNESS` |
-| `font_matrix`  | `src/font_matrix/main/font_matrix_main.c`      | `#define BRIGHTNESS` |
-| `game_matrix`  | `src/game_matrix/main/game_matrix_main.c`      | `#define BRIGHTNESS` |
-| `http_matrix`  | `src/http_matrix/main/http_matrix_main.c`      | `#define BRIGHTNESS` |
-| `snake_matrix` | `src/snake_matrix/main/snake_matrix_main.c`    | `#define BRIGHTNESS` |
+| App            | File                                           | Symbol / notes                                      |
+| -------------- | ---------------------------------------------- | --------------------------------------------------- |
+| `color_matrix` | `src/color_matrix/main/color_matrix_main.c`    | `#define BRIGHTNESS`                                |
+| `font_matrix`  | `src/font_matrix/main/font_matrix_main.c`      | `#define BRIGHTNESS`                                |
+| `game_matrix`  | `src/game_matrix/main/game_matrix_main.c`      | `#define BRIGHTNESS`                                |
+| `http_matrix`  | `src/http_matrix/main/http_matrix_main.c`      | **`BRIGHTNESS_DEFAULT`** + runtime **`brightness`** |
+| `snake_matrix` | `src/snake_matrix/main/snake_matrix_main.c`    | `#define BRIGHTNESS`                                |
 
-Defaults here are set **lower** than typical Arduino “full brightness” examples to reduce heat. If it is too dim, increase `BRIGHTNESS` a little, rebuild, and flash; if it is still too bright, lower it (e.g. **10–20** for a dim night display).
+Defaults here are set **lower** than typical Arduino “full brightness” examples to reduce heat. If it is too dim, increase brightness (in **`http_matrix`**, use the slider or **`/api/config`**; in other apps, change **`BRIGHTNESS`** and rebuild). For a dim night display, try **10–20**.
 
 ---
 

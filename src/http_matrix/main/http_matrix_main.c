@@ -17,6 +17,7 @@
 #include "led_strip.h"
 #include "lwip/ip4_addr.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 
 #include "glcdfont.h"
 #include "cjk8x8.h"
@@ -33,7 +34,8 @@ static const char *TAG = "http_matrix";
 #define MATRIX_W        8
 #define MATRIX_H        8
 #define LED_COUNT       64
-#define BRIGHTNESS      10
+/** Default LED linear gain at boot (1–255). Runtime UI/API overrides `s_brightness`. */
+#define BRIGHTNESS_DEFAULT 10
 #define TEXT_MAX        512
 #define CJK_CELL_W      8
 #define GLYPH_GAP       1
@@ -60,13 +62,20 @@ typedef enum {
     OC_ZOOM_OUT,
 } oc_zoom_t;
 
-/** Scrolling marquee axis and travel direction. */
+/** Horizontal marquee travel direction. */
 typedef enum {
     MARQUEE_DIR_LEFT = 0,
     MARQUEE_DIR_RIGHT,
-    MARQUEE_DIR_UP,
-    MARQUEE_DIR_DOWN,
 } marquee_dir_t;
+
+/** Glyph scale vs 8×8 cell: Small 5/8, Medium 7/8, Large 8/8. */
+typedef enum {
+    FONT_SZ_SMALL = 0,
+    FONT_SZ_MEDIUM,
+    FONT_SZ_LARGE,
+} font_size_t;
+
+#define NVS_NS "http_mtx"
 
 static led_strip_handle_t s_strip;
 static SemaphoreHandle_t s_mtx;
@@ -75,7 +84,6 @@ static char s_text[TEXT_MAX] = "ESP32-S3-Matrix 中文测试";
 /** 1 = run text/animation; 0 = full-panel fill / idle (no text frames). */
 static volatile int s_flow_flag = 1;
 static int s_scroll_x = MATRIX_W;
-static int s_scroll_y = 0;
 
 static volatile disp_mode_t s_disp_mode = DISP_MARQUEE;
 static volatile int s_speed = SPEED_DEFAULT; /* 1 = slow … 10 = fast */
@@ -88,9 +96,13 @@ static volatile uint8_t s_rainbow_hue = 0;
 static volatile size_t s_cc_off = 0;
 
 static volatile marquee_dir_t s_marquee_dir = MARQUEE_DIR_LEFT;
+/** Linear brightness scale applied to all LEDs (1 dim … 255 bright). */
+static volatile uint8_t s_brightness = BRIGHTNESS_DEFAULT;
 
 static volatile oc_zoom_t s_oc_zoom = OC_ZOOM_NONE;
 static volatile int s_oc_phase = 0;
+
+static volatile font_size_t s_font_size = FONT_SZ_LARGE;
 
 static inline int neomatrix_index_tl_rp(int x, int y)
 {
@@ -122,18 +134,6 @@ static int width_one_codepoint(uint32_t cp)
         return get_char_width((char)cp) + GLYPH_GAP;
     }
     return get_char_width('?') + GLYPH_GAP;
-}
-
-static int get_string_width(const char *str)
-{
-    int width = 0;
-    const char *p = str;
-    while (*p != '\0') {
-        uint32_t cp = 0;
-        utf8_decode(&p, &cp);
-        width += width_one_codepoint(cp);
-    }
-    return width;
 }
 
 static void draw_cjk8_at(uint8_t px[LED_COUNT][3], int16_t x0, int16_t y0, const uint8_t rows[8],
@@ -202,8 +202,9 @@ static void draw_char_at(uint8_t px[LED_COUNT][3], int16_t x0, int16_t y0, unsig
     }
 }
 
-static void draw_string_at(uint8_t px[LED_COUNT][3], int16_t x0, int16_t y0, const char *str,
-                           uint8_t fr, uint8_t fg, uint8_t fb)
+/** Full-resolution text row (scale 1:1 in cell coordinates). */
+static void draw_string_at_full(uint8_t px[LED_COUNT][3], int16_t x0, int16_t y0, const char *str,
+                                uint8_t fr, uint8_t fg, uint8_t fb)
 {
     const uint8_t br = 0, bg = 0, bb = 0;
     int16_t x = x0;
@@ -262,9 +263,46 @@ static void draw_one_codepoint(uint8_t px[LED_COUNT][3], int16_t x0, int16_t y0,
     draw_char_at(px, x0, y0, '?', fr, fg, fb, br, bg, bb);
 }
 
+/** Place scaled glyph mask with top-left at (dst_x, dst_y) in matrix coordinates. */
+static void blit_mask_scaled_at(uint8_t px[LED_COUNT][3], const uint8_t m[8][8], int gw, int zoom_num,
+                                int zoom_den, int16_t dst_x, int16_t dst_y, uint8_t fr, uint8_t fg,
+                                uint8_t fb)
+{
+    if (gw < 1) {
+        gw = 1;
+    }
+    if (zoom_num < 1) {
+        zoom_num = 1;
+    }
+    if (zoom_den < 1) {
+        zoom_den = 1;
+    }
+
+    const int scaled_w = (gw * zoom_num + zoom_den - 1) / zoom_den;
+    const int scaled_h = (8 * zoom_num + zoom_den - 1) / zoom_den;
+
+    for (int dy = 0; dy < MATRIX_H; dy++) {
+        for (int dx = 0; dx < MATRIX_W; dx++) {
+            const int mx = dx - (int)dst_x;
+            const int my = dy - (int)dst_y;
+            if (mx < 0 || my < 0 || mx >= scaled_w || my >= scaled_h) {
+                continue;
+            }
+            const int gx = (mx * zoom_den) / zoom_num;
+            const int gy = (my * zoom_den) / zoom_num;
+            if (gx >= 0 && gx < gw && gy >= 0 && gy < 8 && m[(unsigned)gy][(unsigned)gx]) {
+                const int idx = neomatrix_index_tl_rp(dx, dy);
+                px[idx][0] = fr;
+                px[idx][1] = fg;
+                px[idx][2] = fb;
+            }
+        }
+    }
+}
+
 /**
- * Draw glyph scaled by zoom_num/zoom_den (each relative to full matrix).
- * Mask is 8×8; glyph occupies columns [0, gw) (ASCII/CJK drawn from x=0).
+ * Draw glyph scaled by zoom_num/zoom_den, centered on the 8×8 matrix (single glyph / zoom FX).
+ * Mask is 8×8; glyph occupies columns [0, gw).
  */
 static void blit_mask_scaled(uint8_t px[LED_COUNT][3], const uint8_t m[8][8], int gw, int zoom_num,
                              int zoom_den, uint8_t fr, uint8_t fg, uint8_t fb)
@@ -283,49 +321,102 @@ static void blit_mask_scaled(uint8_t px[LED_COUNT][3], const uint8_t m[8][8], in
     const int scaled_h = (8 * zoom_num + zoom_den - 1) / zoom_den;
     const int ox = (MATRIX_W - scaled_w) / 2;
     const int oy = (MATRIX_H - scaled_h) / 2;
+    blit_mask_scaled_at(px, m, gw, zoom_num, zoom_den, (int16_t)ox, (int16_t)oy, fr, fg, fb);
+}
 
-    for (int dy = 0; dy < MATRIX_H; dy++) {
-        for (int dx = 0; dx < MATRIX_W; dx++) {
-            if (dx < ox || dx >= ox + scaled_w || dy < oy || dy >= oy + scaled_h) {
-                continue;
-            }
-            const int gx = ((dx - ox) * zoom_den) / zoom_num;
-            const int gy = ((dy - oy) * zoom_den) / zoom_num;
-            if (gx >= 0 && gx < gw && gy >= 0 && gy < 8 && m[(unsigned)gy][(unsigned)gx]) {
-                const int idx = neomatrix_index_tl_rp(dx, dy);
-                px[idx][0] = fr;
-                px[idx][1] = fg;
-                px[idx][2] = fb;
+static void codepoint_to_mask(uint32_t cp, uint8_t m[8][8])
+{
+    memset(m, 0, sizeof(m[0][0]) * 64U);
+    uint8_t tmp[LED_COUNT][3];
+    memset(tmp, 0, sizeof(tmp));
+    draw_one_codepoint(tmp, 0, 0, cp, 1, 1, 1);
+    for (int yy = 0; yy < 8; yy++) {
+        for (int xx = 0; xx < 8; xx++) {
+            const int idx = neomatrix_index_tl_rp(xx, yy);
+            if (tmp[idx][0] | tmp[idx][1] | tmp[idx][2]) {
+                m[yy][xx] = 1;
             }
         }
+    }
+}
+
+static void font_scale(font_size_t fs, int *zn, int *zd)
+{
+    *zd = 8;
+    switch (fs) {
+        case FONT_SZ_SMALL:
+            *zn = 5;
+            break;
+        case FONT_SZ_MEDIUM:
+            *zn = 7;
+            break;
+        default:
+        case FONT_SZ_LARGE:
+            *zn = 8;
+            break;
+    }
+}
+
+static int get_string_width_scaled(const char *str, int zn, int zd)
+{
+    int width = 0;
+    const char *p = str;
+    while (*p != '\0') {
+        uint32_t cp = 0;
+        utf8_decode(&p, &cp);
+        width += (width_one_codepoint(cp) * zn + zd - 1) / zd;
+    }
+    return width;
+}
+
+/** Marquee / static line with optional fractional scaling (zn/zd). */
+static void draw_text_line(uint8_t px[LED_COUNT][3], int16_t x0, int16_t y0, const char *str,
+                           uint8_t fr, uint8_t fg, uint8_t fb, int zn, int zd)
+{
+    if (zn >= zd) {
+        draw_string_at_full(px, x0, y0, str, fr, fg, fb);
+        return;
+    }
+
+    int16_t x = x0;
+    const char *p = str;
+    while (*p != '\0') {
+        uint32_t cp = 0;
+        utf8_decode(&p, &cp);
+
+        if (cp == 0x3000) {
+            x += (width_one_codepoint(cp) * zn + zd - 1) / zd;
+            continue;
+        }
+
+        if (cp < 32 && cp != ' ') {
+            continue;
+        }
+
+        uint8_t m[8][8];
+        codepoint_to_mask(cp, m);
+        int gw = width_one_codepoint(cp) - GLYPH_GAP;
+        if (gw < 1) {
+            gw = 1;
+        }
+        const int sh = (8 * zn + zd - 1) / zd;
+        const int dst_y = (int)y0 + (8 - sh);
+        blit_mask_scaled_at(px, m, gw, zn, zd, x, (int16_t)dst_y, fr, fg, fb);
+        x += (width_one_codepoint(cp) * zn + zd - 1) / zd;
     }
 }
 
 /** Must be called with s_mtx held. Sets scroll start from text size and direction. */
 static void marquee_reset_marquee_locked(void)
 {
-    const int tw = get_string_width(s_text);
-    switch (s_marquee_dir) {
-        case MARQUEE_DIR_LEFT:
-            s_scroll_x = MATRIX_W;
-            s_scroll_y = 0;
-            break;
-        case MARQUEE_DIR_RIGHT:
-            s_scroll_x = -tw;
-            s_scroll_y = 0;
-            break;
-        case MARQUEE_DIR_DOWN:
-            s_scroll_x = 0;
-            s_scroll_y = -MATRIX_H;
-            break;
-        case MARQUEE_DIR_UP:
-            s_scroll_x = 0;
-            s_scroll_y = MATRIX_H;
-            break;
-        default:
-            s_scroll_x = MATRIX_W;
-            s_scroll_y = 0;
-            break;
+    int zn = 8;
+    int zd = 8;
+    font_scale(s_font_size, &zn, &zd);
+    const int tw = get_string_width_scaled(s_text, zn, zd);
+    if (s_marquee_dir == MARQUEE_DIR_RIGHT) {
+        s_scroll_x = -tw;
+    } else {
+        s_scroll_x = MATRIX_W;
     }
 }
 
@@ -384,7 +475,8 @@ static void apply_rainbow(uint8_t px[LED_COUNT][3], uint8_t hue_base)
 
 static uint8_t scale_bright(uint8_t v)
 {
-    return (uint8_t)(((uint32_t)v * BRIGHTNESS + 127U) / 255U);
+    const unsigned int g = (unsigned int)s_brightness;
+    return (uint8_t)((v * g + 127U) / 255U);
 }
 
 static void push_frame(const uint8_t px[LED_COUNT][3])
@@ -415,10 +507,10 @@ static void display_step(void)
     bool rainbow;
     size_t cc_off;
     int scroll_x;
-    int scroll_y;
     marquee_dir_t marquee_dir;
     oc_zoom_t oc_zoom;
     int oc_phase;
+    font_size_t font_sz;
 
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     strncpy(buf, s_text, sizeof(buf));
@@ -430,11 +522,15 @@ static void display_step(void)
     rainbow = s_rainbow;
     cc_off = s_cc_off;
     scroll_x = s_scroll_x;
-    scroll_y = s_scroll_y;
     marquee_dir = s_marquee_dir;
     oc_zoom = s_oc_zoom;
     oc_phase = s_oc_phase;
+    font_sz = s_font_size;
     xSemaphoreGive(s_mtx);
+
+    int zn_font = 8;
+    int zd_font = 8;
+    font_scale(font_sz, &zn_font, &zd_font);
 
     uint8_t px[LED_COUNT][3];
     memset(px, 0, sizeof(px));
@@ -446,7 +542,7 @@ static void display_step(void)
 
     switch (mode) {
         case DISP_STATIC:
-            draw_string_at(px, 0, 0, buf, cr, cg, cb);
+            draw_text_line(px, 0, 0, buf, cr, cg, cb, zn_font, zd_font);
             break;
         case DISP_ONE_CHAR: {
             const size_t bl = strlen(buf);
@@ -472,15 +568,16 @@ static void display_step(void)
                 gw = 1;
             }
 
-            int zn = 8;
-            const int zd = 8;
+            int zn_anim = 8;
             if (oc_zoom == OC_ZOOM_IN) {
-                zn = oc_phase + 1;
+                zn_anim = oc_phase + 1;
             } else if (oc_zoom == OC_ZOOM_OUT) {
-                zn = 8 - oc_phase;
+                zn_anim = 8 - oc_phase;
             }
 
-            if (oc_zoom == OC_ZOOM_NONE) {
+            const int zn_use = (zn_font * zn_anim + 7) / 8;
+
+            if (oc_zoom == OC_ZOOM_NONE && zn_font >= zd_font) {
                 const int w = gw;
                 int x0 = (MATRIX_W - w) / 2;
                 if (x0 < 0) {
@@ -491,21 +588,18 @@ static void display_step(void)
                 s_cc_off = next_off_base;
                 s_oc_phase = 0;
                 xSemaphoreGive(s_mtx);
+            } else if (oc_zoom == OC_ZOOM_NONE) {
+                uint8_t m[8][8];
+                codepoint_to_mask(cp, m);
+                blit_mask_scaled(px, m, gw, zn_font, zd_font, cr, cg, cb);
+                xSemaphoreTake(s_mtx, portMAX_DELAY);
+                s_cc_off = next_off_base;
+                s_oc_phase = 0;
+                xSemaphoreGive(s_mtx);
             } else {
                 uint8_t m[8][8];
-                uint8_t tmp[LED_COUNT][3];
-                memset(tmp, 0, sizeof(tmp));
-                memset(m, 0, sizeof(m));
-                draw_one_codepoint(tmp, 0, 0, cp, 1, 1, 1);
-                for (int yy = 0; yy < 8; yy++) {
-                    for (int xx = 0; xx < 8; xx++) {
-                        const int idx = neomatrix_index_tl_rp(xx, yy);
-                        if (tmp[idx][0] | tmp[idx][1] | tmp[idx][2]) {
-                            m[yy][xx] = 1;
-                        }
-                    }
-                }
-                blit_mask_scaled(px, m, gw, zn, zd, cr, cg, cb);
+                codepoint_to_mask(cp, m);
+                blit_mask_scaled(px, m, gw, zn_use, 8, cr, cg, cb);
 
                 xSemaphoreTake(s_mtx, portMAX_DELAY);
                 s_oc_phase = oc_phase + 1;
@@ -519,7 +613,7 @@ static void display_step(void)
         }
         case DISP_MARQUEE:
         default:
-            draw_string_at(px, scroll_x, scroll_y, buf, cr, cg, cb);
+            draw_text_line(px, scroll_x, 0, buf, cr, cg, cb, zn_font, zd_font);
             break;
     }
 
@@ -535,38 +629,21 @@ static void display_step(void)
     push_frame(px);
 
     if (mode == DISP_MARQUEE) {
-        const int tw = get_string_width(buf);
+        const int tw = get_string_width_scaled(buf, zn_font, zd_font);
         xSemaphoreTake(s_mtx, portMAX_DELAY);
         if (tw <= 0) {
             /* keep position */
         } else {
-            switch (marquee_dir) {
-                case MARQUEE_DIR_LEFT:
-                    s_scroll_x--;
-                    if (s_scroll_x < -tw) {
-                        marquee_reset_marquee_locked();
-                    }
-                    break;
-                case MARQUEE_DIR_RIGHT:
-                    s_scroll_x++;
-                    if (s_scroll_x > MATRIX_W) {
-                        marquee_reset_marquee_locked();
-                    }
-                    break;
-                case MARQUEE_DIR_DOWN:
-                    s_scroll_y++;
-                    if (s_scroll_y >= MATRIX_H) {
-                        marquee_reset_marquee_locked();
-                    }
-                    break;
-                case MARQUEE_DIR_UP:
-                    s_scroll_y--;
-                    if (s_scroll_y <= -MATRIX_H) {
-                        marquee_reset_marquee_locked();
-                    }
-                    break;
-                default:
-                    break;
+            if (marquee_dir == MARQUEE_DIR_RIGHT) {
+                s_scroll_x++;
+                if (s_scroll_x > MATRIX_W) {
+                    marquee_reset_marquee_locked();
+                }
+            } else {
+                s_scroll_x--;
+                if (s_scroll_x < -tw) {
+                    marquee_reset_marquee_locked();
+                }
             }
         }
         xSemaphoreGive(s_mtx);
@@ -600,7 +677,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         ".hint{font-size:.75rem;color:#777;margin-top:4px}"
         ".actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}"
         "</style></head><body><div class=\"wrap\">"
-        "<header><h1>ESP32-S3-Matrix</h1></header>"
+        "<header><h1>ESP32-S3-Matrix</h1>"
+        "<p style=\"margin:8px 0 0;font-size:.8rem;opacity:.85\">Message &amp; settings persist across reboot (flash).</p></header>"
         "<div class=\"card\">"
         "<div class=\"row\"><label for=\"text\">Message (UTF-8, Chinese subset)</label>"
         "<input type=\"text\" id=\"text\" maxlength=\"400\" placeholder=\"hello\" />"
@@ -609,6 +687,10 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<input type=\"range\" id=\"speed\" min=\"1\" max=\"10\" value=\"5\" "
         "oninput=\"document.getElementById('speedLbl').textContent=this.value\" />"
         "<p class=\"hint\">Higher number = faster scrolling or character advance.</p></div>"
+        "<div class=\"row\"><label>Brightness <span class=\"speed-val\" id=\"brightLbl\">10</span> / 255</label>"
+        "<input type=\"range\" id=\"bright\" min=\"1\" max=\"255\" value=\"10\" "
+        "oninput=\"document.getElementById('brightLbl').textContent=this.value\" />"
+        "<p class=\"hint\">Lower = dimmer (less heat). Applied after Apply settings.</p></div>"
         "<div class=\"row\"><label for=\"mode\">Display mode</label>"
         "<select id=\"mode\">"
         "<option value=\"marquee\">Scrolling marquee</option>"
@@ -620,10 +702,15 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<select id=\"dir\">"
         "<option value=\"left\">Left — text moves left</option>"
         "<option value=\"right\">Right — text moves right</option>"
-        "<option value=\"down\">Down — top to bottom</option>"
-        "<option value=\"up\">Up — bottom to top</option>"
         "</select>"
         "<p class=\"hint\">Used when mode is scrolling marquee.</p></div>"
+        "<div class=\"row\"><label for=\"fontsize\">Font size</label>"
+        "<select id=\"fontsize\">"
+        "<option value=\"large\">Large — full cell height</option>"
+        "<option value=\"medium\">Medium</option>"
+        "<option value=\"small\">Small</option>"
+        "</select>"
+        "<p class=\"hint\">Scales glyphs (marquee, static, one-character).</p></div>"
         "<div class=\"row\"><label for=\"zoom\">One-character zoom</label>"
         "<select id=\"zoom\">"
         "<option value=\"none\">None — snap to full size</option>"
@@ -660,9 +747,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "fetch('/SendData?data='+encodeURIComponent(t));}"
         "function applyConfig(){"
         "fetch('/api/config?'+q({speed:document.getElementById('speed').value,"
+        "brightness:document.getElementById('bright').value,"
         "mode:document.getElementById('mode').value,color:document.getElementById('color').value,"
         "rainbow:document.getElementById('rainbow').checked?'1':'0',"
         "direction:document.getElementById('dir').value,"
+        "fontsize:document.getElementById('fontsize').value,"
         "zoom:document.getElementById('zoom').value}));}"
         "function clearPanel(){fetch('/api/config?'+q({mode:'fill',color:'off',rainbow:'0'}));}"
         "</script></body></html>";
@@ -750,6 +839,131 @@ static void url_decode_inplace(char *s)
     *w = '\0';
 }
 
+static void settings_save(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+
+    char text_copy[TEXT_MAX];
+    int speed_copy;
+    uint8_t bright_copy;
+    uint8_t mode_copy;
+    uint8_t mdir_copy;
+    uint8_t zoom_copy;
+    uint8_t cr_c;
+    uint8_t cg_c;
+    uint8_t cb_c;
+    uint8_t rb_c;
+    uint8_t font_copy;
+
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    strncpy(text_copy, s_text, sizeof(text_copy));
+    text_copy[sizeof(text_copy) - 1] = '\0';
+    speed_copy = s_speed;
+    bright_copy = s_brightness;
+    mode_copy = (uint8_t)s_disp_mode;
+    mdir_copy = (uint8_t)s_marquee_dir;
+    zoom_copy = (uint8_t)s_oc_zoom;
+    cr_c = s_cr;
+    cg_c = s_cg;
+    cb_c = s_cb;
+    rb_c = s_rainbow ? (uint8_t)1 : (uint8_t)0;
+    font_copy = (uint8_t)s_font_size;
+    xSemaphoreGive(s_mtx);
+
+    if (nvs_set_str(h, "text", text_copy) != ESP_OK) {
+        goto done;
+    }
+    (void)nvs_set_u8(h, "spd", (uint8_t)speed_copy);
+    (void)nvs_set_u8(h, "brt", bright_copy);
+    (void)nvs_set_u8(h, "mode", mode_copy);
+    (void)nvs_set_u8(h, "mdir", mdir_copy);
+    (void)nvs_set_u8(h, "zoom", zoom_copy);
+    (void)nvs_set_u8(h, "cr", cr_c);
+    (void)nvs_set_u8(h, "cg", cg_c);
+    (void)nvs_set_u8(h, "cb", cb_c);
+    (void)nvs_set_u8(h, "rb", rb_c);
+    (void)nvs_set_u8(h, "font", font_copy);
+    (void)nvs_commit(h);
+done:
+    nvs_close(h);
+}
+
+static void settings_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+
+    size_t len = TEXT_MAX;
+    char tbuf[TEXT_MAX];
+    if (nvs_get_str(h, "text", tbuf, &len) == ESP_OK) {
+        strncpy(s_text, tbuf, sizeof(s_text));
+        s_text[sizeof(s_text) - 1] = '\0';
+    }
+
+    uint8_t v = 0;
+    if (nvs_get_u8(h, "spd", &v) == ESP_OK && v >= 1 && v <= 10) {
+        s_speed = v;
+        s_period_ticks = 24 - 2 * v;
+        if (s_period_ticks < 2) {
+            s_period_ticks = 2;
+        }
+    }
+
+    if (nvs_get_u8(h, "brt", &v) == ESP_OK && v >= 1) {
+        s_brightness = v;
+    }
+
+    uint8_t m = 0;
+    if (nvs_get_u8(h, "mode", &m) == ESP_OK && m <= (uint8_t)DISP_FILL) {
+        s_disp_mode = (disp_mode_t)m;
+    }
+
+    if (nvs_get_u8(h, "mdir", &m) == ESP_OK && m <= (uint8_t)MARQUEE_DIR_RIGHT) {
+        s_marquee_dir = (marquee_dir_t)m;
+    }
+
+    if (nvs_get_u8(h, "zoom", &m) == ESP_OK && m <= (uint8_t)OC_ZOOM_OUT) {
+        s_oc_zoom = (oc_zoom_t)m;
+    }
+
+    if (nvs_get_u8(h, "cr", &v) == ESP_OK) {
+        s_cr = v;
+    }
+    if (nvs_get_u8(h, "cg", &v) == ESP_OK) {
+        s_cg = v;
+    }
+    if (nvs_get_u8(h, "cb", &v) == ESP_OK) {
+        s_cb = v;
+    }
+
+    if (nvs_get_u8(h, "rb", &v) == ESP_OK) {
+        s_rainbow = (v != 0);
+    }
+
+    if (nvs_get_u8(h, "font", &m) == ESP_OK && m <= (uint8_t)FONT_SZ_LARGE) {
+        s_font_size = (font_size_t)m;
+    }
+
+    if (s_disp_mode == DISP_FILL) {
+        s_flow_flag = 0;
+    } else {
+        s_flow_flag = 1;
+        marquee_reset_marquee_locked();
+    }
+    s_cc_off = 0;
+    s_oc_phase = 0;
+
+    xSemaphoreGive(s_mtx);
+    nvs_close(h);
+}
+
 static esp_err_t send_data_handler(httpd_req_t *req)
 {
     char qs[1024];
@@ -783,6 +997,8 @@ static esp_err_t send_data_handler(httpd_req_t *req)
     s_oc_phase = 0;
     s_flow_flag = 1;
     xSemaphoreGive(s_mtx);
+
+    settings_save();
 
     ESP_LOGI(TAG, "Scroll on, len=%u text=%s", (unsigned)strlen(val), val);
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
@@ -888,6 +1104,17 @@ static esp_err_t api_config_handler(httpd_req_t *req)
         }
     }
 
+    if (query_get_value(qs, "brightness", val, sizeof(val)) == ESP_OK) {
+        int b = atoi(val);
+        if (b < 1) {
+            b = 1;
+        }
+        if (b > 255) {
+            b = 255;
+        }
+        s_brightness = (uint8_t)b;
+    }
+
     if (query_get_value(qs, "rainbow", val, sizeof(val)) == ESP_OK) {
         rb_in = (val[0] == '1' || val[0] == 't' || val[0] == 'T' || val[0] == 'y' || val[0] == 'Y') ? 1
                                                                                                  : 0;
@@ -937,15 +1164,7 @@ static esp_err_t api_config_handler(httpd_req_t *req)
     }
 
     if (query_get_value(qs, "direction", val, sizeof(val)) == ESP_OK) {
-        if (!strcmp(val, "right")) {
-            s_marquee_dir = MARQUEE_DIR_RIGHT;
-        } else if (!strcmp(val, "up")) {
-            s_marquee_dir = MARQUEE_DIR_UP;
-        } else if (!strcmp(val, "down")) {
-            s_marquee_dir = MARQUEE_DIR_DOWN;
-        } else {
-            s_marquee_dir = MARQUEE_DIR_LEFT;
-        }
+        s_marquee_dir = (!strcmp(val, "right")) ? MARQUEE_DIR_RIGHT : MARQUEE_DIR_LEFT;
         if (s_disp_mode == DISP_MARQUEE) {
             marquee_reset_marquee_locked();
         }
@@ -962,6 +1181,19 @@ static esp_err_t api_config_handler(httpd_req_t *req)
         s_oc_phase = 0;
     }
 
+    if (query_get_value(qs, "fontsize", val, sizeof(val)) == ESP_OK) {
+        if (!strcmp(val, "small")) {
+            s_font_size = FONT_SZ_SMALL;
+        } else if (!strcmp(val, "medium")) {
+            s_font_size = FONT_SZ_MEDIUM;
+        } else {
+            s_font_size = FONT_SZ_LARGE;
+        }
+        if (s_disp_mode == DISP_MARQUEE) {
+            marquee_reset_marquee_locked();
+        }
+    }
+
     if (s_disp_mode == DISP_FILL && (ch_mode || ch_color)) {
         wipe_fill = true;
         wr = s_cr;
@@ -974,6 +1206,8 @@ static esp_err_t api_config_handler(httpd_req_t *req)
     if (wipe_fill) {
         color_wipe_rgb(wr, wg, wb);
     }
+
+    settings_save();
 
     ESP_LOGI(TAG, "api/config mode=%d speed=%d rainbow=%d", (int)s_disp_mode, s_speed, (int)s_rainbow);
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
@@ -990,6 +1224,7 @@ static esp_err_t rgb_on_handler(httpd_req_t *req)
     s_rainbow = false;
     s_flow_flag = 0;
     xSemaphoreGive(s_mtx);
+    settings_save();
     color_wipe_rgb(0, 255, 0);
     ESP_LOGI(TAG, "Legacy RGB On → full panel green (lamp)");
     httpd_resp_set_type(req, "text/plain");
@@ -1005,6 +1240,7 @@ static esp_err_t rgb_off_handler(httpd_req_t *req)
     s_cc_off = 0;
     s_oc_phase = 0;
     xSemaphoreGive(s_mtx);
+    settings_save();
     color_wipe_rgb(0, 0, 0);
     ESP_LOGI(TAG, "Legacy RGB Off → marquee, LEDs cleared");
     httpd_resp_set_type(req, "text/plain");
@@ -1084,16 +1320,14 @@ static void wifi_init_softap(void)
 void app_main(void)
 {
     s_mtx = xSemaphoreCreateMutex();
-    s_flow_flag = 1;
-    xSemaphoreTake(s_mtx, portMAX_DELAY);
-    marquee_reset_marquee_locked();
-    xSemaphoreGive(s_mtx);
+
+    ESP_ERROR_CHECK(nvs_flash_init());
+    settings_load();
+
     s_period_ticks = 24 - 2 * s_speed;
     if (s_period_ticks < 2) {
         s_period_ticks = 2;
     }
-
-    ESP_ERROR_CHECK(nvs_flash_init());
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
